@@ -170,11 +170,11 @@ func (sc *SubCache[EntityT, ExcerptT, CacheT]) Load() error {
 	}
 
 	// simple heuristic to detect a mismatch between the index and the entities
-	count, err := index.DocCount()
+	indexBuiltFrom, err := index.BuiltFrom()
 	if err != nil {
 		return err
 	}
-	if count != uint64(len(sc.excerpts)) {
+	if len(indexBuiltFrom) != len(sc.excerpts) {
 		return fmt.Errorf("count mismatch between bleve and %s excerpts", sc.namespace)
 	}
 
@@ -301,22 +301,22 @@ func (sc *SubCache[EntityT, ExcerptT, CacheT]) Build() <-chan BuildEvent {
 			return
 		}
 
-		indexer, indexEnd := index.IndexBatch()
-		var batch []derived[ExcerptT]
+		batch := index.NewBatch()
+		var pending []derived[ExcerptT]
 
 		// the derived state of a batch is published once the batch is in the
 		// index, so that the index is never behind it
 		endBatch := func() error {
-			if err := indexEnd(); err != nil {
+			if err := batch.Apply(); err != nil {
 				return err
 			}
 			sc.muMaps.Lock()
-			for _, d := range batch {
+			for _, d := range pending {
 				sc.excerpts[d.excerpt.Id()] = d.excerpt
 				sc.builtFrom[d.excerpt.Id()] = d.commit
 			}
 			sc.muMaps.Unlock()
-			batch = batch[:0]
+			pending = pending[:0]
 			return nil
 		}
 
@@ -334,16 +334,16 @@ func (sc *SubCache[EntityT, ExcerptT, CacheT]) Build() <-chan BuildEvent {
 			// loaded or not.
 			d := sc.buildDerived(sc.newCached(e.Entity))
 
-			if err := indexer(e.Entity.Id().String(), d.indexData); err != nil {
+			if err := batch.Set(e.Entity.Id().String(), d.indexData, d.commit); err != nil {
 				out <- BuildEvent{
 					Typename: sc.typename,
 					Err:      err,
 				}
 				return
 			}
-			batch = append(batch, d)
+			pending = append(pending, d)
 
-			if len(batch) >= maxBatchCount {
+			if len(pending) >= maxBatchCount {
 				err = endBatch()
 				if err != nil {
 					out <- BuildEvent{
@@ -353,7 +353,7 @@ func (sc *SubCache[EntityT, ExcerptT, CacheT]) Build() <-chan BuildEvent {
 					return
 				}
 
-				indexer, indexEnd = index.IndexBatch()
+				batch = index.NewBatch()
 			}
 
 			out <- BuildEvent{
@@ -364,7 +364,7 @@ func (sc *SubCache[EntityT, ExcerptT, CacheT]) Build() <-chan BuildEvent {
 			}
 		}
 
-		if len(batch) > 0 {
+		if len(pending) > 0 {
 			err = endBatch()
 			if err != nil {
 				out <- BuildEvent{
@@ -622,7 +622,9 @@ func (sc *SubCache[EntityT, ExcerptT, CacheT]) Remove(prefix string) error {
 		if err != nil {
 			return err
 		}
-		return index.Remove(e.Id().String())
+		batch := index.NewBatch()
+		batch.Remove(e.Id().String())
+		return batch.Apply()
 	}()
 	if err != nil {
 		return err
@@ -876,7 +878,12 @@ func (sc *SubCache[EntityT, ExcerptT, CacheT]) publishDerivedLocked(fresh CacheT
 
 	// index first, so that the index is never behind what builtFrom records.
 	// Readers of the index must tolerate it being ahead of the excerpts.
-	err = index.IndexOne(id.String(), d.indexData)
+	batch := index.NewBatch()
+	err = batch.Set(id.String(), d.indexData, d.commit)
+	if err != nil {
+		return 0, err
+	}
+	err = batch.Apply()
 	if err != nil {
 		return 0, err
 	}
@@ -919,7 +926,9 @@ func (sc *SubCache[EntityT, ExcerptT, CacheT]) dropDerived(id entity.Id) (Entity
 	if err != nil {
 		return 0, err
 	}
-	err = index.Remove(id.String())
+	batch := index.NewBatch()
+	batch.Remove(id.String())
+	err = batch.Apply()
 	if err != nil {
 		return 0, err
 	}

@@ -19,8 +19,8 @@ import (
 	"github.com/git-bug/git-bug/repository"
 )
 
-// requireDerivedBuiltFromRefs checks that the cache recorded, for every entity,
-// the commit its reference points to, and nothing else.
+// requireDerivedBuiltFromRefs checks that the cache and the index recorded, for
+// every entity, the commit its reference points to, and nothing else.
 func requireDerivedBuiltFromRefs(t *testing.T, repo repository.ClockedRepo, c *RepoCache) {
 	t.Helper()
 
@@ -34,6 +34,12 @@ func requireDerivedBuiltFromRefs(t *testing.T, repo repository.ClockedRepo, c *R
 		}
 		require.Equal(t, expected, builtFrom)
 		require.Equal(t, len(expected), excerpts)
+
+		index, err := repo.GetIndex(namespace)
+		require.NoError(t, err)
+		indexBuiltFrom, err := index.BuiltFrom()
+		require.NoError(t, err)
+		require.Equal(t, refs, indexBuiltFrom)
 	}
 
 	c.bugs.muMaps.RLock()
@@ -158,6 +164,28 @@ func TestSubCacheDerived(t *testing.T) {
 		c = createTestRepoCacheNoEvents(t, repo)
 		require.Empty(t, c.bugs.cached)
 		require.Empty(t, c.identities.cached)
+		requireDerivedBuiltFromRefs(t, repo, c)
+	})
+
+	t.Run("an index without record is rebuilt", func(t *testing.T) {
+		repo := repository.CreateGoGitTestRepo(t, false)
+
+		c, err := NewRepoCacheNoEvents(repo)
+		require.NoError(t, err)
+		rene, err := c.Identities().New("René Descartes", "rene@descartes.fr")
+		require.NoError(t, err)
+		require.NoError(t, c.SetUserIdentity(rene))
+		_, _, err = c.Bugs().New("title", "message")
+		require.NoError(t, err)
+		require.NoError(t, c.Close())
+
+		// what an index written before it recorded anything, or a lost one,
+		// looks like to the cache
+		index, err := repo.GetIndex(bug.Namespace)
+		require.NoError(t, err)
+		require.NoError(t, index.Clear())
+
+		c = createTestRepoCacheNoEvents(t, repo)
 		requireDerivedBuiltFromRefs(t, repo, c)
 	})
 
@@ -330,11 +358,6 @@ func TestSubCacheDerived(t *testing.T) {
 		require.NoError(t, c.bugs.onCommit(b.Id()))
 
 		requireDerivedBuiltFromRefs(t, repo, c)
-		index, err := repo.GetIndex(bug.Namespace)
-		require.NoError(t, err)
-		count, err := index.DocCount()
-		require.NoError(t, err)
-		require.Zero(t, count)
 	})
 
 	t.Run("an entity removed while being added is not registered", func(t *testing.T) {
@@ -369,11 +392,6 @@ func TestSubCacheDerived(t *testing.T) {
 
 		requireDerivedBuiltFromRefs(t, repo, c)
 		require.NotContains(t, c.bugs.cached, b.Id())
-		index, err := repo.GetIndex(bug.Namespace)
-		require.NoError(t, err)
-		count, err := index.DocCount()
-		require.NoError(t, err)
-		require.Zero(t, count)
 	})
 
 	t.Run("a search hit without excerpt is skipped", func(t *testing.T) {
@@ -383,7 +401,9 @@ func TestSubCacheDerived(t *testing.T) {
 		// the index is written before the excerpt is published
 		index, err := repo.GetIndex(bug.Namespace)
 		require.NoError(t, err)
-		require.NoError(t, index.IndexOne("notyetpublished", []string{"markerahead"}))
+		batch := index.NewBatch()
+		require.NoError(t, batch.Set("notyetpublished", []string{"markerahead"}, "1111111111111111111111111111111111111111"))
+		require.NoError(t, batch.Apply())
 
 		require.Empty(t, searchBugs(t, c, "markerahead"))
 	})
